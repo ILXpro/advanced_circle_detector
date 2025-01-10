@@ -9,6 +9,12 @@ from matplotlib.figure import Figure
 from scipy.ndimage import gaussian_filter
 from scipy.interpolate import interp1d
 from scipy.optimize import least_squares
+from concurrent.futures import ThreadPoolExecutor
+from scipy.optimize import minimize
+import math
+
+MAX_IMAGE_SIZE = 800  # Maximum size for initial processing
+MIN_POINTS_FOR_CIRCLE = 5  # Minimum points needed for circle fitting
 
 class ResultsWindow(QDialog):
     def __init__(self, parent=None):
@@ -68,6 +74,7 @@ class ImageCanvas(QGraphicsView):
         self.overlay_item = None
         self.scale_factor = 1.0
         self.zoom_mode = False
+        self.points = []  # Store drawn points for curve fitting
 
     def toggleZoomMode(self, enabled):
         self.zoom_mode = enabled
@@ -85,7 +92,9 @@ class ImageCanvas(QGraphicsView):
         else:
             if event.button() == Qt.LeftButton:
                 self.drawing = True
-                self.last_point = self.mapToScene(event.pos())
+                point = self.mapToScene(event.pos())
+                self.last_point = point
+                self.points.append((point.x(), point.y()))
 
     def mouseMoveEvent(self, event):
         if not self.zoom_mode and self.drawing and self.last_point and self.overlay_item:
@@ -99,6 +108,7 @@ class ImageCanvas(QGraphicsView):
             painter.end()
             self.overlay_item.setPixmap(self.overlay_pixmap)
             self.last_point = new_point
+            self.points.append((new_point.x(), new_point.y()))
             self.scene.update()
 
     def mouseReleaseEvent(self, event):
@@ -136,14 +146,17 @@ class ImageCanvas(QGraphicsView):
         self.overlay_pixmap = QPixmap(size)
         self.overlay_pixmap.fill(Qt.transparent)
         self.overlay_item = self.scene.addPixmap(self.overlay_pixmap)
+        self.points = []  # Clear stored points
 
 class CircleDetector(QMainWindow):
     def __init__(self):
         super().__init__()
         self.title = 'Advanced Lens Analyzer'
         self.image = None
+        self.original_image = None  # Store original image
         self.processed_image = None
         self.results_window = ResultsWindow(self)
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
         self.initUI()
 
     def initUI(self):
@@ -250,12 +263,21 @@ class CircleDetector(QMainWindow):
         control_layout.addStretch()
         layout.addWidget(control_panel)
 
+    def resizeImage(self, image):
+        height, width = image.shape[:2]
+        if max(height, width) > MAX_IMAGE_SIZE:
+            scale = MAX_IMAGE_SIZE / max(height, width)
+            new_size = (int(width * scale), int(height * scale))
+            return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+        return image
+
     def openImage(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Open Image", "", 
                                                 "Image Files (*.png *.jpg *.bmp)")
         if filename:
-            self.image = cv2.imread(filename)
-            if self.image is not None:
+            self.original_image = cv2.imread(filename)
+            if self.original_image is not None:
+                self.image = self.resizeImage(self.original_image.copy())
                 self.processed_image = self.image.copy()
                 self.updateDisplay()
                 self.auto_btn.setEnabled(True)
@@ -288,91 +310,70 @@ class CircleDetector(QMainWindow):
     def clearBrush(self):
         self.image_canvas.clearOverlay()
 
-    def getIntensityProfile(self, img, center, radius, num_points=360):
-        angles = np.linspace(0, 2*np.pi, num_points)
-        profile_points = []
-        intensities = []
-        
-        for angle in angles:
-            # Sample points along radius
-            r_points = np.linspace(0.5*radius, 1.5*radius, 50)
-            r_intensities = []
-            
-            for r in r_points:
-                x = center[0] + r * np.cos(angle)
-                y = center[1] + r * np.sin(angle)
-                
-                if 0 <= x < img.shape[1]-1 and 0 <= y < img.shape[0]-1:
-                    # Bilinear interpolation for sub-pixel accuracy
-                    x0, y0 = int(x), int(y)
-                    x1, y1 = x0 + 1, y0 + 1
-                    fx, fy = x - x0, y - y0
-                    
-                    intensity = (1-fx)*(1-fy)*img[y0, x0] + \
-                               fx*(1-fy)*img[y0, x1] + \
-                               (1-fx)*fy*img[y1, x0] + \
-                               fx*fy*img[y1, x1]
-                    
-                    r_intensities.append((r, intensity))
-            
-            if r_intensities:
-                # Find edge using intensity gradient
-                r_vals, i_vals = zip(*r_intensities)
-                gradient = np.gradient(i_vals)
-                edge_idx = np.argmax(np.abs(gradient))
-                
-                if edge_idx > 0:
-                    r_edge = r_vals[edge_idx]
-                    x_edge = center[0] + r_edge * np.cos(angle)
-                    y_edge = center[1] + r_edge * np.sin(angle)
-                    profile_points.append((x_edge, y_edge))
-                    intensities.append(i_vals[edge_idx])
-        
-        return np.array(profile_points), np.array(intensities)
+    def fitCircleToPoints(self, points):
+        if len(points) < MIN_POINTS_FOR_CIRCLE:
+            return None, None, None
 
-    def fitCircle(self, points, weights=None):
-        def circle_residuals(params, points, weights):
+        points = np.array(points)
+        
+        def circle_error(params):
             xc, yc, r = params
-            distances = np.sqrt((points[:,0] - xc)**2 + (points[:,1] - yc)**2) - r
-            if weights is None:
-                return distances
-            return distances * weights
+            distances = np.sqrt((points[:,0] - xc)**2 + (points[:,1] - yc)**2)
+            return np.sum((distances - r)**2)
+
+        # Initial guess using bounding box
+        x_m = np.mean(points[:,0])
+        y_m = np.mean(points[:,1])
+        r_guess = np.mean(np.sqrt((points[:,0] - x_m)**2 + (points[:,1] - y_m)**2))
         
-        # Initial guess using weighted mean
-        if weights is None:
-            weights = np.ones(len(points))
-        weights = np.array(weights) / np.sum(weights)
-        
-        center_guess = np.average(points, weights=weights, axis=0)
-        radius_guess = np.average(np.sqrt(np.sum((points - center_guess)**2, axis=1)), 
-                                weights=weights)
-        
-        # Optimize circle parameters
-        params_guess = [center_guess[0], center_guess[1], radius_guess]
-        result = least_squares(circle_residuals, params_guess, 
-                             args=(points, weights), method='lm')
-        
-        return result.x, result.cost
+        result = minimize(circle_error, [x_m, y_m, r_guess], method='Nelder-Mead')
+        if result.success:
+            return result.x[0], result.x[1], result.x[2]
+        return None, None, None
+
+    def autoDetect(self):
+    if self.image is None:
+        return
+
+    gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    height, width = gray.shape
+    
+    # Define relative circle sizes based on image dimensions
+    min_radius = min(height, width) // 8
+    max_radius = min(height, width) // 2
+    
+    circle_params = [
+        {'radius_range': (max_radius//2, max_radius),
+         'color': (255, 0, 0)},  # Large circle
+        {'radius_range': (max_radius//3, max_radius//2),
+         'color': (0, 255, 0)},  # Medium circle
+        {'radius_range': (min_radius, max_radius//3),
+         'color': (0, 0, 255)}   # Small circle
+    ]
+
+
 
     def autoDetect(self):
         if self.image is None:
             return
 
+        # Work with resized image for initial detection
         gray = cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         height, width = gray.shape
         image_area = height * width
-        
+
         # Parameters for three circles
         circle_params = [
-            {'radius_range': (int(np.sqrt(0.5 * image_area / np.pi)), 
-                            int(np.sqrt(0.8 * image_area / np.pi))),
+            {'radius_range': (int(np.sqrt(0.3 * image_area / np.pi)), 
+                            int(np.sqrt(0.6 * image_area / np.pi))),
              'color': (255, 0, 0)},  # Large circle
-            {'radius_range': (int(np.sqrt(0.15 * image_area / np.pi)), 
-                            int(np.sqrt(0.25 * image_area / np.pi))),
+            {'radius_range': (int(np.sqrt(0.1 * image_area / np.pi)), 
+                            int(np.sqrt(0.2 * image_area / np.pi))),
              'color': (0, 255, 0)},  # Medium circle
-            {'radius_range': (int(np.sqrt(0.05 * image_area / np.pi)), 
-                            int(np.sqrt(0.08 * image_area / np.pi))),
+            {'radius_range': (int(np.sqrt(0.03 * image_area / np.pi)), 
+                            int(np.sqrt(0.06 * image_area / np.pi))),
              'color': (0, 0, 255)}   # Small circle
         ]
 
@@ -380,13 +381,14 @@ class CircleDetector(QMainWindow):
         circles_data = []
         previous_center = None
 
+        # Process each circle size
         for i, params in enumerate(circle_params):
             edges = cv2.Canny(blurred, 50, 150)
             circles = cv2.HoughCircles(
                 edges,
                 cv2.HOUGH_GRADIENT,
                 dp=1,
-                minDist=width//2,
+                minDist=width//4,  # Reduced from width//2 for better detection
                 param1=50,
                 param2=30,
                 minRadius=params['radius_range'][0],
@@ -394,16 +396,32 @@ class CircleDetector(QMainWindow):
             )
             
             if circles is not None:
+                # Get the strongest circle
                 circle = circles[0][0]
-                if previous_center is not None:
-                    circle[0:2] = previous_center
                 
+                # Refine detection on original image
+                scale_factor = self.original_image.shape[1] / self.image.shape[1]
+                refined_x = int(circle[0] * scale_factor)
+                refined_y = int(circle[1] * scale_factor)
+                refined_r = int(circle[2] * scale_factor)
+                
+                # Get refined edge points using original image
+                gray_orig = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
                 profile_points, intensities = self.getIntensityProfile(
-                    gray, (circle[0], circle[1]), circle[2])
+                    gray_orig, 
+                    (refined_x, refined_y), 
+                    refined_r
+                )
                 
                 if len(profile_points) > 10:
                     weights = np.abs(np.gradient(intensities))
                     (xc, yc, r), fit_error = self.fitCircle(profile_points, weights)
+                    
+                    # Scale back to display image coordinates
+                    xc /= scale_factor
+                    yc /= scale_factor
+                    r /= scale_factor
+                    
                     intensity_drop = self.calculateIntensityDrop(gray, (xc, yc), r)
                     
                     concentricity = 0.0
@@ -414,8 +432,9 @@ class CircleDetector(QMainWindow):
                     circles_data.append((xc, yc, r, intensity_drop, concentricity))
                     previous_center = [xc, yc]
                     
+                    # Draw detected circle
                     cv2.circle(result, (int(xc), int(yc)), int(r), params['color'], 2)
-                    cv2.putText(result, str(i+1), (int(xc)-10, int(yc)-10),
+                    cv2.putText(result, f"{i+1}", (int(xc)-10, int(yc)-10),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.9, params['color'], 2)
 
         self.processed_image = result
@@ -424,6 +443,83 @@ class CircleDetector(QMainWindow):
         if circles_data:
             self.results_window.updateResults(circles_data)
             self.results_window.show()
+
+
+    def detectInROI(self):
+        if self.image is None or not self.image_canvas.points:
+            return
+
+        # Get drawn points
+        points = np.array(self.image_canvas.points)
+        
+        # Fit circle to drawn points
+        xc, yc, r = self.fitCircleToPoints(points)
+        
+        if xc is not None:
+            result = self.image.copy()
+            
+            # Scale to original image for precise measurements
+            scale_factor = self.original_image.shape[1] / self.image.shape[1]
+            orig_xc = xc * scale_factor
+            orig_yc = yc * scale_factor
+            orig_r = r * scale_factor
+            
+            # Get intensity profile from original image
+            gray_orig = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2GRAY)
+            profile_points, intensities = self.getIntensityProfile(
+                gray_orig,
+                (orig_xc, orig_yc),
+                orig_r
+            )
+            
+            # Calculate intensity drop
+            intensity_drop = self.calculateIntensityDrop(
+                cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY),
+                (xc, yc),
+                r
+            )
+            
+            # Draw detected circle
+            cv2.circle(result, (int(xc), int(yc)), int(r), (0, 255, 0), 2)
+            cv2.circle(result, (int(xc), int(yc)), 2, (0, 255, 0), 3)
+            
+            circles_data = [(xc, yc, r, intensity_drop, 0.0)]
+            
+            self.processed_image = result
+            self.updateDisplay()
+            
+            self.results_window.updateResults(circles_data)
+            self.results_window.show()
+
+    def getIntensityProfile(self, img, center, radius, num_points=360):
+        x, y = center
+        points = []
+        intensities = []
+        
+        angles = np.linspace(0, 2*np.pi, num_points)
+        for angle in angles:
+            # Sample multiple points along each radius
+            r_points = np.linspace(0.8*radius, 1.2*radius, 20)
+            for r in r_points:
+                px = x + r * np.cos(angle)
+                py = y + r * np.sin(angle)
+                
+                if 0 <= px < img.shape[1]-1 and 0 <= py < img.shape[0]-1:
+                    # Bilinear interpolation
+                    x0, y0 = int(px), int(py)
+                    x1, y1 = x0 + 1, y0 + 1
+                    fx, fy = px - x0, py - y0
+                    
+                    intensity = (1-fx)*(1-fy)*img[y0, x0] + \
+                               fx*(1-fy)*img[y0, x1] + \
+                               (1-fx)*fy*img[y1, x0] + \
+                               fx*fy*img[y1, x1]
+                    
+                    points.append([px, py])
+                    intensities.append(intensity)
+        
+        return np.array(points), np.array(intensities)
+
 
     def calculateIntensityDrop(self, img, center, radius):
         x, y = int(center[0]), int(center[1])
@@ -448,87 +544,23 @@ class CircleDetector(QMainWindow):
         
         return 0.0
 
-    def detectInROI(self):
-        if self.image is None or self.image_canvas.overlay_item is None:
-            return
-
-        overlay_pixmap = self.image_canvas.overlay_pixmap
-        mask = overlay_pixmap.toImage()
-        buffer = mask.bits().asstring(mask.byteCount())
-        mask = np.frombuffer(buffer, dtype=np.uint8).reshape(
-            (mask.height(), mask.width(), 4))[:,:,3]
+    def fitCircle(self, points, weights):
+        def circle_residuals(params, points, weights):
+            xc, yc, r = params
+            distances = np.sqrt((points[:,0] - xc)**2 + (points[:,1] - yc)**2) - r
+            return distances * weights
         
-        mask = cv2.resize(mask, (self.image.shape[1], self.image.shape[0]))
-        mask = (mask > 0).astype(np.uint8) * 255
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, 
-                                     cv2.CHAIN_APPROX_SIMPLE)
+        # Initial guess using weighted mean
+        weights = np.array(weights) / np.sum(weights)
+        center_guess = np.average(points, weights=weights, axis=0)
+        radius_guess = np.average(np.sqrt(np.sum((points - center_guess)**2, axis=1)), 
+                                weights=weights)
         
-        if not contours:
-            return
-
-        x, y, w, h = cv2.boundingRect(contours[0])
-        margin = 20
-        roi = self.image[max(0, y-margin):min(self.image.shape[0], y+h+margin),
-                        max(0, x-margin):min(self.image.shape[1], x+w+margin)]
-        roi_mask = mask[max(0, y-margin):min(self.image.shape[0], y+h+margin),
-                       max(0, x-margin):min(self.image.shape[1], x+w+margin)]
-
-        if roi.size == 0:
-            return
-
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blurred_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
-        mean = np.mean(blurred_roi)
-        edges_roi = cv2.Canny(blurred_roi, mean * 0.66, mean * 1.33)
-        edges_roi[roi_mask == 0] = 0
-
-        circles = cv2.HoughCircles(
-            edges_roi,
-            cv2.HOUGH_GRADIENT,
-            dp=1,
-            minDist=30,
-            param1=50,
-            param2=30,
-            minRadius=10,
-            maxRadius=min(roi.shape) // 2
-        )
-
-        result = self.image.copy()
-        if circles is not None:
-            circles = np.uint16(np.around(circles[0]))
-            circles_data = []
-            
-            for circle in circles:
-                x_orig = circle[0] + max(0, x-margin)
-                y_orig = circle[1] + max(0, y-margin)
-                
-                profile_points, intensities = self.getIntensityProfile(
-                    cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY),
-                    (x_orig, y_orig),
-                    circle[2]
-                )
-                
-                if len(profile_points) > 10:
-                    weights = np.abs(np.gradient(intensities))
-                    (xc, yc, r), fit_error = self.fitCircle(profile_points, weights)
-                    intensity_drop = self.calculateIntensityDrop(
-                        cv2.cvtColor(self.image, cv2.COLOR_BGR2GRAY),
-                        (xc, yc),
-                        r
-                    )
-                    
-                    circles_data.append((xc, yc, r, intensity_drop, 0.0))
-                    
-                    cv2.circle(result, (int(xc), int(yc)), int(r), (0, 255, 0), 2)
-                    cv2.circle(result, (int(xc), int(yc)), 2, (0, 255, 0), 3)
-
-            if circles_data:
-                self.results_window.updateResults(circles_data)
-                self.results_window.show()
-
-        self.processed_image = result
-        self.updateDisplay()
+        params_guess = [center_guess[0], center_guess[1], radius_guess]
+        result = least_squares(circle_residuals, params_guess, 
+                             args=(points, weights), method='lm')
+        
+        return result.x, result.cost
 
     def updateImage(self):
         if self.image is None:
